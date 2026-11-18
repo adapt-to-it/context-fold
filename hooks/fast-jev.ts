@@ -9,7 +9,7 @@ import type {
 } from 'claude-code';
 
 import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
-import { olderPartCut, planTopics, summaryInstructions, touchedFiles, type TouchedFiles } from '../src/plan.js';
+import { modelTopicAsker, olderPartCut, planTopics, summaryInstructions, touchedFiles, type TouchedFiles } from '../src/plan.js';
 import { collectToolCalls, fitState, latestRequest, recentRequests } from '../src/state.js';
 import { pickRules, ruleUnits, rulesNote, rulesQuestion } from '../src/rules.js';
 import { compactionLog, logPath, type CompactionLog } from './log.js';
@@ -42,6 +42,14 @@ const SUMMARY_SYSTEM =
   'Write the summary in the language the user writes in, and keep any rule they set about the language of replies.';
 /** The reply cap of a summary; a reply that reaches it was cut short and is not used. */
 const SUMMARY_MAX_TOKENS = 16_000;
+/** After a 402 (no credit) Jev is skipped for this long: every call would fail the same way. */
+const JEV_PAUSE_MS = 60 * 60 * 1000;
+/** Until when Jev is skipped; 0 when it is in use. */
+let jevPausedUntil = 0;
+/** Pauses Jev when `error` says the organization has no credit left. */
+function pauseOnNoCredit(error: unknown): void {
+  if (error instanceof Error && error.message.includes('(402)')) jevPausedUntil = Date.now() + JEV_PAUSE_MS;
+}
 
 /** Caps the transcript a summary model reads; the newest characters stay. */
 const TRANSCRIPT_LIMIT = 600_000;
@@ -446,7 +454,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (isMain && isPrecompute) precomputed = undefined;
       if (!isPrecompute) $.ui.status('Jev is compacting the context…');
       try {
-        const config = { ...configured, apiKey: await getApiKey($, configured) };
+        const key = Date.now() < jevPausedUntil ? undefined : await getApiKey($, configured);
+        const config = { ...configured, apiKey: key };
         const fetchFn: HookFetch = async (url, init) => {
           const response = await $.http.fetch(url, init);
           return { status: response.status, ok: response.ok, text: response.text };
@@ -455,7 +464,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
         /** Old tool results shortened, every call and text kept; computed once. */
         let shortening: ReturnType<typeof compactSession> | undefined;
         const shorten = () =>
-          (shortening ??= compactSession(event.messages, { ...config, resultsOnly: true }, fetchFn));
+          (shortening ??= compactSession(event.messages, { ...config, resultsOnly: true }, fetchFn).catch(
+            (error: unknown) => {
+              pauseOnNoCredit(error);
+              throw error;
+            },
+          ));
         /** The rules note for these messages and the picked units, or none when no rule file is set or readable. */
         const rulesFor = async (messages: readonly SessionMessage[]): Promise<{ note: string; picked?: string[] }> => {
           if (config.rulesFiles.length === 0) return { note: '' };
@@ -554,16 +568,36 @@ export const register: Register = (on: On, options: PluginOptions) => {
           );
           return { messages };
         };
-        // Finished topics go to the built-in summarizer, alone; the rest stays as it is.
-        if (!isPrecompute && config.pruneTopics !== false && config.apiKey) {
+        // Finished topics go to the summarizer, alone; the rest stays as it is.
+        // Without Jev (no key, no credit, no answer) the summary model picks the cut.
+        const summaryModel = config.summaryModel;
+        if (!isPrecompute && config.pruneTopics !== false && (config.apiKey || summaryModel)) {
           const reference = event.instructions?.trim() ?? '';
+          const empty = { cut: 0, turns: [], stateTokens: 0, stateStage: '' };
+          const viaModel = () =>
+            summaryModel
+              ? planTopics(
+                  event.messages,
+                  modelTopicAsker(async (prompt) => {
+                    $.ui.status(`${summaryModel} is looking for finished topics…`);
+                    const reply = await $.model.complete({ model: summaryModel, prompt, maxTokens: 50, effort: 'low', timeoutMs: 30_000 });
+                    if (!reply.isAnswered) throw new Error(reply.reason);
+                    return reply.text;
+                  }, reference || latestRequest(event.messages, 1000)),
+                  resolveOptions(config),
+                  reference,
+                )
+              : Promise.resolve(empty);
           // A failed plan only means nothing is summarized: the results path still runs.
-          const plan = await planTopics(
-            event.messages,
-            jevAsker(fetchFn, config.apiKey, config.model),
-            resolveOptions(config),
-            reference,
-          ).catch(() => ({ cut: 0, turns: [], stateTokens: 0, stateStage: '' }));
+          const plan = await (config.apiKey
+            ? planTopics(event.messages, jevAsker(fetchFn, config.apiKey, config.model), resolveOptions(config), reference).catch(
+                (error: unknown) => {
+                  pauseOnNoCredit(error);
+                  return viaModel();
+                },
+              )
+            : viaModel()
+          ).catch(() => empty);
           const obsolete = event.messages.slice(0, plan.cut);
           const total = event.messages.reduce((sum, m) => sum + messageChars(m), 0);
           const share = total > 0 ? obsolete.reduce((sum, m) => sum + messageChars(m), 0) / total : 0;
@@ -576,7 +610,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
           }
         }
         // Nothing finished to summarize: only old tool results are shortened.
-        const { result, messages } = await shorten();
+        const shortened = await shorten().catch(() => undefined);
+        if (!shortened) {
+          // Jev did not answer: the older part goes to the summary model, the newest stays.
+          const cut = isPrecompute
+            ? 0
+            : olderPartCut(event.messages, config.summarizeShare, resolveOptions(config).preserveRecentMessages, messageChars);
+          if (cut > 0 && config.summaryModel) {
+            const done = await summarizeOlder(cut, 'in the older part', planned);
+            if (done) return done;
+          }
+          throw new Error(config.apiKey ? 'Jev did not answer' : 'Jev is not available');
+        }
+        const { result, messages } = shortened;
         // A small context keeps its shortened results: a summary there costs time and saves little.
         const small = result.stats.charsBefore <= config.smallContextChars && reductionRatio(result) > 0;
         if (!small && reductionRatio(result) < config.minReductionRatio) {
