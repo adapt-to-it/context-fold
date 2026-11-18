@@ -43,6 +43,13 @@ steps in order and stops at the first one that applies:
 4. **Built-in compact.** When none of the steps above applies, or a step
    fails, Claude Code's own compact summarizes the whole session.
 
+When Jev does not answer (no key, no credit, a network error), the plugin
+does not stop at the built-in compact. `summaryModel` reads the user
+requests, one per turn, and picks the turn where the current work starts.
+Step 1 then summarizes the turns before it. With no finished topic, step 3
+summarizes the older part. After a 402 reply (no credit), the plugin skips
+Jev for one hour.
+
 Every summary works the same way:
 
 - The summarizer reads the part to summarize with its old tool results

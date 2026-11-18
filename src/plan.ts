@@ -1,7 +1,7 @@
 import { fitTurnQuestions } from './compact.js';
 import { collectToolCalls, fitState } from './state.js';
 import { decideTurns, segmentTurns, turnQuestions } from './turns.js';
-import type { JevAsker, Message, ResolvedCompactOptions, TurnDecision } from './types.js';
+import type { JevAsker, JevResponse, Message, ResolvedCompactOptions, TurnDecision } from './types.js';
 
 /** Files the summarized messages touched, each listed once, in order of first appearance. */
 export interface TouchedFiles {
@@ -74,6 +74,42 @@ export async function planTopics(
     turns: decided.map((turn, n) => ({ ...turn, dropped: n < prefix })),
     stateTokens: state.tokens,
     stateStage: state.stage,
+  };
+}
+
+/** The prompt that asks a model the `topic_start` Choice Jev answers otherwise. */
+export function topicChoicePrompt(criteria: Readonly<Record<string, string | null>>, reference: string): string {
+  const turns = Object.entries(criteria).map(([id, request]) => `${id}: ${request ?? ''}`);
+  return [
+    'Below are the user requests of a conversation, one per turn, oldest first.',
+    reference ? `The user's next request: "${reference}"` : 'The current work is the one the latest requests continue.',
+    'Which turn starts the line of work the current requests still continue: the earliest turn whose request, decisions or results the current work still builds on? Pick the latest turn when the latest request starts a new topic.',
+    'Reply with the turn id alone, such as T03.',
+    '',
+    ...turns,
+  ].join('\n');
+}
+
+/** The turn id in a model's reply, or undefined when it names none of `ids`. */
+export function parseTopicChoice(text: string, ids: readonly string[]): string | undefined {
+  const found = text.match(/\bT\d+\b/g) ?? [];
+  return found.find((id) => ids.includes(id));
+}
+
+/**
+ * A `JevAsker` that answers only `topic_start`, through a model such as
+ * Haiku: the fallback when Jev has no credit or does not answer.
+ */
+export function modelTopicAsker(complete: (prompt: string) => Promise<string>, reference: string): JevAsker {
+  return {
+    async ask(_state, questions): Promise<JevResponse> {
+      const topic = questions.topic_start;
+      if (!topic || topic.type !== 'choice') return { answers: {} };
+      const ids = Object.keys(topic.criteria);
+      const choice = parseTopicChoice(await complete(topicChoicePrompt(topic.criteria, reference)), ids);
+      if (!choice) throw new Error('the model named no turn');
+      return { answers: { topic_start: { choice, confidence: 1, probabilities: { [choice]: 1 } } } };
+    },
   };
 }
 

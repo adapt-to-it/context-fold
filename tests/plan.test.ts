@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_OPTIONS } from '../src/compact.js';
-import { planTopics, summaryInstructions, touchedFiles, olderPartCut } from '../src/plan.js';
+import { modelTopicAsker, parseTopicChoice, planTopics, summaryInstructions, touchedFiles, olderPartCut } from '../src/plan.js';
 import type {
   CompactionState,
   JevAsker,
@@ -89,6 +89,33 @@ describe('planTopics', () => {
     const plan = await planTopics(conversation(4), asker, options(2), 'next');
     expect(plan.cut).toBe(0);
     expect(plan.turns.every((turn) => !turn.dropped)).toBe(true);
+  });
+});
+
+describe('modelTopicAsker', () => {
+  it('lets the model pick the cut when Jev is not available', async () => {
+    const prompts: string[] = [];
+    const asker = modelTopicAsker(async (prompt) => {
+      prompts.push(prompt);
+      return 'T03';
+    }, 'next task');
+    const plan = await planTopics(conversation(4), asker, options(2), 'next task');
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('"next task"');
+    expect(prompts[0]).toContain('T01: request 1');
+    expect(plan.cut).toBe(4);
+    expect(plan.turns.map((turn) => turn.dropped)).toEqual([true, true, false, false]);
+  });
+
+  it('throws when the reply names no turn, so the caller can fall back', async () => {
+    const asker = modelTopicAsker(async () => 'no idea', '');
+    await expect(planTopics(conversation(4), asker, options(2), '')).rejects.toThrow('no turn');
+  });
+
+  it('reads the first known turn id in the reply', () => {
+    expect(parseTopicChoice('The work starts at T02.', ['T01', 'T02'])).toBe('T02');
+    expect(parseTopicChoice('T09, then T01', ['T01', 'T02'])).toBe('T01');
+    expect(parseTopicChoice('none', ['T01'])).toBeUndefined();
   });
 });
 
