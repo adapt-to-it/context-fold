@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "context-fold",
   "version": "0.10.3",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
   "author": {
     "name": "adapt-to-it",
     "url": "https://github.com/adapt-to-it"
@@ -137,7 +137,7 @@
     "logDir": {
       "type": "string",
       "title": "Decision log directory",
-      "description": "Where the decision log is written. Leave unset for ~/.claude/fast-jev-compaction/logs.",
+      "description": "Where the decision log is written. Leave unset for ~/.claude/context-fold/logs.",
       "default": ""
     }
   }

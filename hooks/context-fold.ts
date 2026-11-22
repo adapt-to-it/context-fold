@@ -97,7 +97,7 @@ export type HookConfig = CompactOptions & {
   resumeAfterCompact: boolean;
   /** Writes one JSON record per compaction under `logDir`. */
   decisionLog: boolean;
-  /** Absent: `~/.claude/fast-jev-compaction/logs`. */
+  /** Absent: `~/.claude/context-fold/logs`. */
   logDir?: string;
   /** Rule files re-added after a summary, relative to the project root; `dir/*.md` takes a folder's files. */
   rulesFiles: string[];
@@ -291,13 +291,13 @@ export function filesNote(files: TouchedFiles): string {
     ...files.mentioned.map((path) => [path, 'mentioned'] as const),
   ].map(([path, action]) => `${path} ${path.split('/').pop() ?? path} "${action}"`);
   if (lines.length === 0) return '';
-  return `[fast-jev-compaction] Files used in the summarized part of the conversation (re-read any you need):\n${lines.join('\n')}`;
+  return `[context-fold] Files used in the summarized part of the conversation (re-read any you need):\n${lines.join('\n')}`;
 }
 
 /** The reply-language rule of the `language` setting, or '' when it is not set. */
 export function languageNote(language: unknown): string {
   if (typeof language !== 'string' || !language.trim()) return '';
-  return `[fast-jev-compaction] Always respond in ${language.trim()}, short status lines between tool calls included.`;
+  return `[context-fold] Always respond in ${language.trim()}, short status lines between tool calls included.`;
 }
 
 /**
@@ -392,7 +392,7 @@ type HomeHost = { env: { get: (name: string) => Promise<string | undefined> }; s
 
 /** The folder of this session's folds: the session id comes from the engine, never from the model. */
 async function sessionFolds($: HomeHost): Promise<string> {
-  return foldDir(`${await $.env.get('HOME')}/.claude/fast-jev-compaction/folds`, await $.session.id());
+  return foldDir(`${await $.env.get('HOME')}/.claude/context-fold/folds`, await $.session.id());
 }
 
 /** Whether the unfold tool is registered in this process. */
@@ -409,7 +409,7 @@ type LogHost = HomeHost & { fs: { write: (path: string, text: string) => Promise
 
 /** Where the decision log is written. */
 async function logDirOf($: HomeHost, config: HookConfig): Promise<string> {
-  return config.logDir ?? `${await $.env.get('HOME')}/.claude/fast-jev-compaction/logs`;
+  return config.logDir ?? `${await $.env.get('HOME')}/.claude/context-fold/logs`;
 }
 
 /** Writes one record of the decision log; a failed write changes nothing. */

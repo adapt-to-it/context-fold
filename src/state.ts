@@ -220,11 +220,11 @@ export function recentRequests(
 }
 
 /** Start of the line that stands for turns this mod removed. */
-export const REMOVED_TURNS_PREFIX = '[fast-jev-compaction removed ';
+export const REMOVED_TURNS_PREFIX = '[context-fold removed ';
 
 /** User messages the engine, a hook or this mod write (notes, summaries, Stop hook feedback): never a request. */
 const NOTICE =
-  /^(?:Tool loaded\.$|\[fast-jev-compaction(?: removed |\] )|\/[\w:-]+$|\(Re-invocation of \/|Stop hook feedback:|Base directory for this skill:|Another Claude session sent a message:|\[SYSTEM NOTIFICATION|This session is being continued from (?:a previous|an earlier) conversation)/;
+  /^(?:Tool loaded\.$|\[context-fold(?: removed |\] )|\/[\w:-]+$|\(Re-invocation of \/|Stop hook feedback:|Base directory for this skill:|Another Claude session sent a message:|\[SYSTEM NOTIFICATION|This session is being continued from (?:a previous|an earlier) conversation)/;
 
 /** A user message's own text, without engine wrappers and notices; empty when nothing is left. */
 export function requestText(text: string): string {

@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "context-fold",
   "version": "0.2.0",
-  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
+  "description": "Folds finished parts of an agent's context to files, keeps a short state and pointers, and reads them back on request.",
   "type": "module",
   "license": "MIT",
   "engines": {

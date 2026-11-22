@@ -13,9 +13,9 @@ export interface FoldStore {
 /** A fold id: `f<n>` a folded part of the conversation, `r<n>` a shortened tool result. */
 export const FOLD_ID = /^[fr][1-9]\d*$/;
 /** The tool the model reads folds back with, as it calls it. */
-export const UNFOLD_TOOL_NAME = 'mcp__fast-jev-compaction__unfold';
-/** Start of the note that lists the folded parts; `[fast-jev-compaction] ` makes it a notice, never a request. */
-export const FOLD_NOTE_HEAD = '[fast-jev-compaction] Folded parts';
+export const UNFOLD_TOOL_NAME = 'mcp__context-fold__unfold';
+/** Start of the note that lists the folded parts; `[context-fold] ` makes it a notice, never a request. */
+export const FOLD_NOTE_HEAD = '[context-fold] Folded parts';
 /** A part longer than this (by `messageChars`) is split into several. */
 export const FOLD_SEGMENT_CHARS = 40_000;
 /** Longest index line. */
@@ -266,8 +266,8 @@ export interface UnfoldAnswer {
  */
 export type Unfold = (input: unknown, store: FoldStore, dir: string) => Promise<UnfoldAnswer>;
 
-/** Start of the note that stands for a closed turn's steps; `[fast-jev-compaction] ` makes it a notice, never a request. */
-export const TURN_NOTE_HEAD = '[fast-jev-compaction] Steps of this turn folded';
+/** Start of the note that stands for a closed turn's steps; `[context-fold] ` makes it a notice, never a request. */
+export const TURN_NOTE_HEAD = '[context-fold] Steps of this turn folded';
 /** A closed turn is folded when its steps hold at least these characters (`messageChars`). */
 export const TURN_FOLD_MIN_CHARS = 20_000;
 /** Most call lines a turn note lists; the calls beyond them are counted in one last line. */
