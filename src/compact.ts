@@ -252,12 +252,15 @@ async function askBatch(
   );
 }
 
+/** End of the note a shortened tool result carries; a fold id takes its place when the result is stored. */
+export const RERUN_HINT = '; re-run the tool if needed]';
+
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
   return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
-  }; re-run the tool if needed]`;
+  }${RERUN_HINT}`;
 }
 
 /**
@@ -406,6 +409,21 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
   return decisions.filter((decision) => decision.reason === reason).length;
 }
 
+/** The sizes and decision counts of a result's `stats`. */
+function sizeStats(messages: readonly Message[], kept: readonly Message[], decisions: readonly CallDecision[]) {
+  return {
+    messagesBefore: messages.length,
+    messagesAfter: kept.length,
+    charsBefore: messages.reduce((sum, message) => sum + messageChars(message), 0),
+    charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+    calls: decisions.length,
+    kept: count(decisions, 'kept'),
+    resultsDropped: count(decisions, 'result_dropped'),
+    callsDropped: count(decisions, 'call_dropped'),
+    pinned: count(decisions, 'pinned'),
+  };
+}
+
 /**
  * Compacts a transcript by asking Jev, for every tool call outside the pinned
  * first and newest messages, whether the call and whether its result must
@@ -422,7 +440,6 @@ export async function compact(
   const resolved = resolveOptions(options);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
   const candidates = calls.filter((call) => !call.pinned);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
@@ -482,19 +499,43 @@ export async function compact(
     decisions,
     turns: turnDecisions,
     stats: {
-      messagesBefore: messages.length,
-      messagesAfter: kept.length,
-      charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
-      calls: calls.length,
-      kept: count(decisions, 'kept'),
-      resultsDropped: count(decisions, 'result_dropped'),
-      callsDropped: count(decisions, 'call_dropped'),
-      pinned: count(decisions, 'pinned'),
+      ...sizeStats(messages, kept, decisions),
       turnsDropped: dropped.length,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length + turnRequests,
+      ms: Date.now() - started,
+    },
+  };
+}
+
+/**
+ * Shortens every tool result that came back before `boundary`, without asking
+ * Jev: each call and each text stays, and so do the first message and the
+ * newest `preserveRecentMessages`.
+ */
+export function shortenResults(
+  messages: readonly Message[],
+  boundary: number,
+  options: CompactOptions = {},
+): CompactResult {
+  const started = Date.now();
+  const resolved = resolveOptions(options);
+  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
+  const decisions = calls.map((call) =>
+    decideCall(call, { keepCall: 1, keepResult: call.resultIndex < boundary ? 0 : 1 }, { keepThreshold: 0.5 }),
+  );
+  const kept = applyDecisions(messages, decisions, calls, resolved.truncateHeadChars);
+  return {
+    messages: kept,
+    decisions,
+    turns: [],
+    stats: {
+      ...sizeStats(messages, kept, decisions),
+      turnsDropped: 0,
+      stateTokens: 0,
+      stateStage: 'local',
+      requests: 0,
       ms: Date.now() - started,
     },
   };

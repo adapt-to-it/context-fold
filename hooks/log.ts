@@ -35,6 +35,8 @@ export type CompactionLog = {
   summaryOutputTokens?: number;
   /** Rule units re-added in full after the summary, as `file › title`. */
   rulesPicked?: string[];
+  /** The ids of the folds this compaction wrote. */
+  folds?: string[];
   files?: TouchedFiles;
   decisions: Array<{
     id: string;
@@ -98,7 +100,7 @@ export function compactionLog(
 }
 
 /** `<dir>/<sessionId>/<timestamp>-<trigger>.json`, safe as a file name. */
-export function logPath(dir: string, log: CompactionLog): string {
+export function logPath(dir: string, log: { at: string; sessionId: string; trigger: string }): string {
   const stamp = log.at.replace(/[:.]/g, '-');
   return `${dir.replace(/\/$/, '')}/${log.sessionId}/${stamp}-${log.trigger}.json`;
 }

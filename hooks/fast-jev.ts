@@ -4,11 +4,16 @@ import type {
   Register,
   SessionMessage,
   ToolResultSummary,
+  ToolSpec,
   ToolUseSummary,
   TurnCompleteInput,
 } from 'claude-code';
 
-import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, messageChars, reductionRatio, resolveOptions, shortenResults } from '../src/compact.js';
+import { foldDir, foldOlder, nextFoldNumbers, pointResults, writeFolds } from '../src/fold.js';
+import { TURN_FOLD_MIN_CHARS, UNFOLD_TOOL, UNFOLD_TOOL_NAME, type FoldStore } from '../src/fold-spec.js';
+import { closedTurnSteps, foldTurn } from '../src/turn-fold.js';
+import { unfold } from '../src/unfold.js';
 import { modelTopicAsker, olderPartCut, planTopics, summaryInstructions, touchedFiles, type TouchedFiles } from '../src/plan.js';
 import { collectToolCalls, fitState, latestRequest, recentRequests } from '../src/state.js';
 import { pickRules, ruleUnits, rulesNote, rulesQuestion } from '../src/rules.js';
@@ -30,17 +35,17 @@ const HOOK_DEFAULTS = {
   summarizeShare: 0.75,
   summaryModel: 'haiku',
   model: DEFAULT_MODEL,
+  useJev: false,
+  foldTurns: false,
+  foldTurnMinChars: TURN_FOLD_MIN_CHARS,
   resumeAfterCompact: true,
   decisionLog: false,
 };
 
-const SUMMARY_SYSTEM =
-  'You summarize the earlier part of a coding session between a user and an AI assistant, so the assistant can continue the work with only your summary and the newer messages. ' +
-  'Write plain text with these sections: Requests (what the user asked, in order, with their exact wording when it sets a rule), ' +
-  'Decisions and constraints, Work done (files, commands, results, commits), Errors and fixes, Open points. ' +
-  'Keep names, paths, identifiers, numbers and versions exact. Do not invent anything. Do not address the user. ' +
-  'Write the summary in the language the user writes in, and keep any rule they set about the language of replies.';
-/** The reply cap of a summary; a reply that reaches it was cut short and is not used. */
+/** Opens the message that stands for the folded part; its first words mark it as a notice, never a request. */
+const FOLD_INTRO =
+  'This session is being continued from an earlier conversation. The earlier part is folded: its state is below, the "Folded parts" note lists what it held, and the newer messages follow verbatim.\n\n';
+/** The reply cap of a fold. */
 const SUMMARY_MAX_TOKENS = 16_000;
 /** After a 402 (no credit) Jev is skipped for this long: every call would fail the same way. */
 const JEV_PAUSE_MS = 60 * 60 * 1000;
@@ -51,37 +56,7 @@ function pauseOnNoCredit(error: unknown): void {
   if (error instanceof Error && error.message.includes('(402)')) jevPausedUntil = Date.now() + JEV_PAUSE_MS;
 }
 
-/** Caps the transcript a summary model reads; the newest characters stay. */
-const TRANSCRIPT_LIMIT = 600_000;
-/** Caps each tool input and result inside that transcript. */
-const PART_LIMIT = 4_000;
-
-const clip = (text: string, limit: number) =>
-  text.length <= limit ? text : `${text.slice(0, limit)} […${text.length - limit} chars cut]`;
-
-/** The messages as plain text for a summary model: texts, tool calls and their results. */
-export function renderTranscript(messages: readonly SessionMessage[], limit = TRANSCRIPT_LIMIT): string {
-  const lines: string[] = [];
-  messages.forEach((message, i) => {
-    const parts = [`[${i}] ${message.role.toUpperCase()}:`];
-    if (message.text) parts.push(message.text);
-    for (const use of message.toolUses) {
-      let input: string;
-      try {
-        input = JSON.stringify(use.input);
-      } catch {
-        input = '{}';
-      }
-      parts.push(`→ ${use.tool} ${clip(input, PART_LIMIT)}`);
-    }
-    for (const result of message.toolResults ?? []) {
-      parts.push(`← ${result.isError ? 'error ' : ''}${clip(result.text, PART_LIMIT)}`);
-    }
-    lines.push(parts.join('\n'));
-  });
-  const text = lines.join('\n\n');
-  return text.length <= limit ? text : `[…earlier part cut]\n${text.slice(text.length - limit)}`;
-}
+export { renderTranscript } from '../src/render.js';
 
 /** The prompt submitted after an automatic compaction, so the work goes on unattended. */
 export const RESUME_PROMPT =
@@ -113,6 +88,12 @@ export type HookConfig = CompactOptions & {
   /** The model that writes summaries (`haiku`, `sonnet`, a full id); empty: the built-in compact. */
   summaryModel: string;
   model: string;
+  /** Asks Jev for the cut, the results to shorten and the rules to re-add; off, the summary model and fixed rules do it. */
+  useJev: boolean;
+  /** Folds a turn's tool steps in place when it closes: the messages before them stay as they are, and so does their prompt cache. */
+  foldTurns: boolean;
+  /** A closed turn is folded when its steps hold at least these characters. */
+  foldTurnMinChars: number;
   resumeAfterCompact: boolean;
   /** Writes one JSON record per compaction under `logDir`. */
   decisionLog: boolean;
@@ -160,6 +141,9 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     summarizeShare: optionNumber(options, 'summarizeShare', HOOK_DEFAULTS.summarizeShare),
     summaryModel: optionString(options, 'summaryModel') ?? HOOK_DEFAULTS.summaryModel,
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    useJev: typeof options['useJev'] === 'boolean' ? options['useJev'] : HOOK_DEFAULTS.useJev,
+    foldTurns: typeof options['foldTurns'] === 'boolean' ? options['foldTurns'] : HOOK_DEFAULTS.foldTurns,
+    foldTurnMinChars: optionNumber(options, 'foldTurnMinChars', HOOK_DEFAULTS.foldTurnMinChars),
     resumeAfterCompact:
       typeof options['resumeAfterCompact'] === 'boolean'
         ? options['resumeAfterCompact']
@@ -380,6 +364,59 @@ function notify(
   $.ui.toast(text, { timeoutMs: 10_000 });
 }
 
+/** A user message the plugin writes. */
+const userMessage = (text: string) => ({ role: 'user', text, toolUses: [] }) as unknown as SessionMessage;
+
+/** A user message the plugin writes to answer tool calls. */
+const resultsMessage = (results: readonly ToolResult[]) =>
+  ({ role: 'user', text: '', toolUses: [], toolResults: results.map(toolResultSummary) }) as unknown as SessionMessage;
+
+/** The engine's file system as a fold store. */
+export function foldStore($: {
+  fs: {
+    read: (path: string) => Promise<unknown>;
+    write: (path: string, text: string) => Promise<unknown>;
+    list: (path: string) => Promise<readonly { name: string; kind: string }[]>;
+  };
+}): FoldStore {
+  return {
+    read: (path) => $.fs.read(path).then((text) => (typeof text === 'string' ? text : undefined), () => undefined),
+    write: async (path, text) => {
+      await $.fs.write(path, text);
+    },
+    list: (dir) => $.fs.list(dir).then((entries) => entries.filter((e) => e.kind === 'file').map((e) => e.name), () => []),
+  };
+}
+
+type HomeHost = { env: { get: (name: string) => Promise<string | undefined> }; session: { id: () => Promise<string> } };
+
+/** The folder of this session's folds: the session id comes from the engine, never from the model. */
+async function sessionFolds($: HomeHost): Promise<string> {
+  return foldDir(`${await $.env.get('HOME')}/.claude/fast-jev-compaction/folds`, await $.session.id());
+}
+
+/** Whether the unfold tool is registered in this process. */
+let unfoldReady = false;
+/** Registers the unfold tool once, when the session has or gets its first fold; false when the engine refuses. */
+async function ensureUnfold($: { tool: { register: (tool: ToolSpec) => Promise<unknown> } }): Promise<boolean> {
+  if (!unfoldReady) unfoldReady = await $.tool.register(UNFOLD_TOOL).then(() => true, () => false);
+  return unfoldReady;
+}
+
+/** What one request read from the prompt cache, wrote to it and sent uncached, in tokens. */
+type CacheTokens = { read: number; written: number; input: number };
+type LogHost = HomeHost & { fs: { write: (path: string, text: string) => Promise<unknown> } };
+
+/** Where the decision log is written. */
+async function logDirOf($: HomeHost, config: HookConfig): Promise<string> {
+  return config.logDir ?? `${await $.env.get('HOME')}/.claude/fast-jev-compaction/logs`;
+}
+
+/** Writes one record of the decision log; a failed write changes nothing. */
+async function logEntry($: LogHost, config: HookConfig, entry: { at: string; sessionId: string; trigger: string } & Record<string, unknown>): Promise<void> {
+  await $.fs.write(logPath(await logDirOf($, config), entry), `${JSON.stringify(entry, null, 2)}\n`).catch(() => undefined);
+}
+
 export type Precomputed = { input: readonly SessionMessage[]; output: SessionMessage[] };
 
 /**
@@ -405,10 +442,54 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
   /** The main conversation's last precomputed compaction: its input and its output. */
   let precomputed: Precomputed | undefined;
+  /** True while `turn.complete` asks for the fold of the turn that just closed. */
+  let foldingTurn = false;
+  /** The cache tokens of the main loop's last request. */
+  let lastCache: CacheTokens | undefined;
+  /** Set by a compaction: the next request's cache tokens are logged against it. */
+  let cacheWatch: { after: string; before?: CacheTokens } | undefined;
+  on('session.start', async ($, event, next) => {
+    // A resumed session has folds already: the tool is there from the first prompt.
+    // With turn folds on it is there from the start too: a tool added later rewrites the whole prompt cache.
+    try {
+      if (configured.foldTurns || (await foldStore($).list(await sessionFolds($))).length > 0) await ensureUnfold($);
+    } catch {
+      // No folder to read: the tool is registered at the first fold.
+    }
+    return next(event);
+  });
+
+  on('tool.call', { tool: UNFOLD_TOOL_NAME }, async ($, event) => {
+    const answer = await unfold(event, foldStore($), await sessionFolds($));
+    if (configured.decisionLog) {
+      // A search with no hit is the sign the index lines are not enough.
+      await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'unfold', id: event['id'], query: event['query'], hits: answer.hits, isError: answer.isError });
+    }
+    return answer.isError ? { deny: answer.text } : { result: answer.text };
+  });
 
   on('session.compact', async ($, event, next) => {
     // A subagent's compaction goes to the engine as it is.
     if (event.agentId !== undefined) return next(event);
+    // The steps of the turn that just closed, folded in place: every message before them is handed back
+    // as the engine has it, so the prompt cache of that prefix stands and only the tail is written again.
+    if (foldingTurn && event.trigger === 'plugin') {
+      try {
+        const at = new Date().toISOString();
+        const folded = (await ensureUnfold($))
+          ? await foldTurn({ messages: event.messages as readonly SessionMessage[], store: foldStore($), dir: await sessionFolds($), at, minChars: configured.foldTurnMinChars, result: resultsMessage })
+          : undefined;
+        if (!folded) return { skip: 'no closed turn to fold' };
+        cacheWatch = { after: 'turn-fold', ...(lastCache ? { before: lastCache } : {}) };
+        if (configured.decisionLog) {
+          const { id, start, end, chars, calls } = folded;
+          await logEntry($, configured, { at, sessionId: await $.session.id(), trigger: 'turn-fold', id, start, end, chars, calls, messagesBefore: event.messages.length, messagesAfter: folded.messages.length });
+        }
+        return { messages: folded.messages };
+      } catch (error) {
+        return { skip: `turn fold not written (${error instanceof Error ? error.message : String(error)})` };
+      }
+    }
     // The text after `/compact` is the next prompt: it runs once the compaction stands.
     const followUp =
       event.trigger === 'manual' && event.agentId === undefined ? event.instructions?.trim() : undefined;
@@ -435,8 +516,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
             after,
           );
           Object.assign(entry, extra);
-          const dir = configured.logDir ?? `${await $.env.get('HOME')}/.claude/fast-jev-compaction/logs`;
-          await $.fs.write(logPath(dir, entry), `${JSON.stringify(entry, null, 2)}\n`);
+          await $.fs.write(logPath(await logDirOf($, configured), entry), `${JSON.stringify(entry, null, 2)}\n`);
         } catch {
           // The log is a diagnostic: a failed write never changes the compaction.
         }
@@ -452,24 +532,47 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       // A new precompute replaces the last one, whatever it comes to.
       if (isMain && isPrecompute) precomputed = undefined;
-      if (!isPrecompute) $.ui.status('Jev is compacting the context…');
+      if (!isPrecompute) $.ui.status('Compacting the context…');
       try {
-        const key = Date.now() < jevPausedUntil ? undefined : await getApiKey($, configured);
+        // Jev is asked only when it is switched on, has a key and is not paused.
+        const key = configured.useJev && Date.now() >= jevPausedUntil ? await getApiKey($, configured) : undefined;
         const config = { ...configured, apiKey: key };
+        const store = foldStore($);
+        const dir = await sessionFolds($);
+        const at = new Date().toISOString();
         const fetchFn: HookFetch = async (url, init) => {
           const response = await $.http.fetch(url, init);
           return { status: response.status, ok: response.ok, text: response.text };
         };
         let planned: Partial<CompactionLog> | undefined;
-        /** Old tool results shortened, every call and text kept; computed once. */
-        let shortening: ReturnType<typeof compactSession> | undefined;
+        /** Where the older part ends: results before it are shortened without Jev, and it is what is folded when no topic is finished. */
+        const olderCut = olderPartCut(event.messages, config.summarizeShare, resolveOptions(config).preserveRecentMessages, messageChars);
+        const shortenLocally = (): SessionCompaction => {
+          // With no older part to tell (its end falls among the newest messages), every result before those goes.
+          const result = shortenResults(event.messages, olderCut || event.messages.length, config);
+          return { result, messages: toSessionMessages(event.messages, result.messages) };
+        };
+        /** Old tool results shortened, every call and text kept; computed once. Jev picks them when it is on and answers. */
+        let shortening: Promise<SessionCompaction> | undefined;
         const shorten = () =>
-          (shortening ??= compactSession(event.messages, { ...config, resultsOnly: true }, fetchFn).catch(
-            (error: unknown) => {
-              pauseOnNoCredit(error);
-              throw error;
-            },
-          ));
+          (shortening ??= config.apiKey
+            ? compactSession(event.messages, { ...config, resultsOnly: true }, fetchFn).catch((error: unknown) => {
+                pauseOnNoCredit(error);
+                return shortenLocally();
+              })
+            : Promise.resolve().then(shortenLocally));
+        /** The shortened results stored as folds, each note naming its id; as they are when that fails. */
+        const pointed = async (messages: SessionMessage[]): Promise<SessionMessage[]> => {
+          try {
+            if (!(await ensureUnfold($))) return messages;
+            const { r } = nextFoldNumbers(await store.list(dir));
+            const out = pointResults(event.messages, messages, r, at);
+            await writeFolds(store, dir, out.entries);
+            return out.messages as unknown as SessionMessage[];
+          } catch {
+            return messages;
+          }
+        };
         /** The rules note for these messages and the picked units, or none when no rule file is set or readable. */
         const rulesFor = async (messages: readonly SessionMessage[]): Promise<{ note: string; picked?: string[] }> => {
           if (config.rulesFiles.length === 0) return { note: '' };
@@ -494,11 +597,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
             return { note: '' };
           }
         };
-        /** The built-in summarizer over `messages[0..cut)` alone; the rest stays as it is. */
-        const summarizeOlder = async (cut: number, what: string, extra: Partial<CompactionLog> = {}) => {
+        /**
+         * Folds `messages[0..cut)`: the original messages go to disk, a short state and one
+         * line per part take their place, the rest stays as it is.
+         */
+        const foldPart = async (cut: number, what: string, extra: Partial<CompactionLog> = {}) => {
           const older = event.messages.slice(0, cut);
-          // The summarizer reads the shortened results: less to read, same calls and texts.
-          const shortened = await shorten().then(
+          // The summary model reads the shortened results: less to read, same calls and texts.
+          const reading = await shorten().then(
             (s) => (s.messages.length === event.messages.length ? s.messages.slice(0, cut) : older),
             () => older,
           );
@@ -507,50 +613,44 @@ export const register: Register = (on: On, options: PluginOptions) => {
           const total = event.messages.reduce((sum, m) => sum + messageChars(m), 0);
           const share = total > 0 ? older.reduce((sum, m) => sum + messageChars(m), 0) / total : 0;
           const started = Date.now();
-          // The project rules the next steps need, chosen by Jev while the summary is written.
+          // The project rules the next steps need, read while the fold is written.
           const rules = rulesFor(event.messages);
           const instructions = summaryInstructions(ref, files);
-          let summarized: { messages?: readonly SessionMessage[] } | undefined;
-          let model = 'built-in';
           let outputTokens: number | undefined;
-          if (config.summaryModel) {
-            $.ui.status(`${config.summaryModel} is summarizing the messages ${what}…`);
+          const complete = async (system: string, prompt: string): Promise<string | undefined> => {
+            if (!config.summaryModel) return undefined;
+            $.ui.status(`${config.summaryModel} is folding the messages ${what}…`);
             const reply = await $.model
-              .complete({
-                model: config.summaryModel,
-                system: SUMMARY_SYSTEM,
-                prompt: `${instructions}\n\n<conversation>\n${renderTranscript(shortened as readonly SessionMessage[])}\n</conversation>`,
-                maxTokens: SUMMARY_MAX_TOKENS,
-                effort: 'low',
-                timeoutMs: 120_000,
-              })
+              .complete({ model: config.summaryModel, system, prompt, maxTokens: SUMMARY_MAX_TOKENS, effort: 'low', timeoutMs: 120_000 })
               .catch(() => undefined);
             outputTokens = reply?.usage.output_tokens;
-            const cutShort = (outputTokens ?? 0) >= SUMMARY_MAX_TOKENS - 50;
-            if (reply?.isAnswered && reply.text.trim() && !cutShort) {
-              model = config.summaryModel;
-              const text =
-                'This session is being continued from an earlier conversation. The earlier part is summarized below; the newer messages follow verbatim.\n\n' +
-                reply.text.trim();
-              summarized = { messages: [{ role: 'user', text, toolUses: [] } as unknown as SessionMessage] };
-            }
-          }
-          if (!summarized) {
+            return reply?.isAnswered && reply.text.trim() ? reply.text : undefined;
+          };
+          // Without the tool or the folder nothing could be read back: the built-in summary stands alone.
+          const fold = (await ensureUnfold($))
+            ? await foldOlder({ older, reading, store, dir, instructions, complete, at }).catch(() => undefined)
+            : undefined;
+          let summarized: { messages?: readonly SessionMessage[] } | undefined;
+          let model = 'built-in';
+          if (fold?.state) {
+            model = config.summaryModel;
+            summarized = { messages: [userMessage(FOLD_INTRO + fold.state)] };
+          } else {
+            // The summary model wrote no state: the built-in summarizer writes it, the index lines stay.
             $.ui.status(`Claude is summarizing the messages ${what}…`);
-            summarized = await next({ ...event, messages: shortened as typeof older, instructions });
+            summarized = await next({ ...event, messages: reading as typeof older, instructions });
           }
           if (!summarized.messages) return undefined;
-          const note = filesNote(files);
           const { note: rulesText, picked } = await rules;
           const messages = [
             ...summarized.messages,
-            ...(note ? [{ role: 'user', text: note, toolUses: [] } as unknown as SessionMessage] : []),
-            ...(rulesText ? [{ role: 'user', text: rulesText, toolUses: [] } as unknown as SessionMessage] : []),
+            ...[fold?.note ?? '', filesNote(files), rulesText].filter(Boolean).map(userMessage),
             ...event.messages.slice(cut),
           ];
-          notify($, `${older.length} messages ${what} summarized by ${model} in ${Math.round((Date.now() - started) / 1000)} s, ${event.messages.length - cut} kept as they are`);
+          const parts = fold ? `folded into ${fold.ids.length} parts` : 'summarized';
+          notify($, `${older.length} messages ${what} ${parts} by ${model} in ${Math.round((Date.now() - started) / 1000)} s, ${event.messages.length - cut} kept as they are`);
           await record(
-            { outcome: 'summarized', note: `${what}: ${older.length} of ${event.messages.length} messages summarized (${percent(share)} of the text)` },
+            { outcome: 'summarized', note: `${what}: ${older.length} of ${event.messages.length} messages ${parts} (${percent(share)} of the text)` },
             undefined,
             messages.length,
             {
@@ -559,16 +659,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
               cut,
               obsoleteShare: Math.round(share * 100) / 100,
               files,
-              summarizedChars: shortened.reduce((sum, m) => sum + messageChars(m), 0),
+              summarizedChars: reading.reduce((sum, m) => sum + messageChars(m), 0),
               summaryModel: model,
               summaryMs: Date.now() - started,
               summaryOutputTokens: outputTokens,
               rulesPicked: picked,
+              folds: fold?.ids,
             },
           );
           return { messages };
         };
-        // Finished topics go to the summarizer, alone; the rest stays as it is.
+        // Finished topics are folded, alone; the rest stays as it is.
         // Without Jev (no key, no credit, no answer) the summary model picks the cut.
         const summaryModel = config.summaryModel;
         if (!isPrecompute && config.pruneTopics !== false && (config.apiKey || summaryModel)) {
@@ -605,50 +706,36 @@ export const register: Register = (on: On, options: PluginOptions) => {
           const files = touchedFiles(obsolete);
           planned = { reference: ref, cut: plan.cut, obsoleteShare: Math.round(share * 100) / 100, turns: plan.turns, files };
           if (plan.cut > 0 && share >= config.minReductionRatio) {
-            const done = await summarizeOlder(plan.cut, 'on finished topics', planned);
+            const done = await foldPart(plan.cut, 'on finished topics', planned);
             if (done) return done;
           }
         }
-        // Nothing finished to summarize: only old tool results are shortened.
-        const shortened = await shorten().catch(() => undefined);
-        if (!shortened) {
-          // Jev did not answer: the older part goes to the summary model, the newest stays.
-          const cut = isPrecompute
-            ? 0
-            : olderPartCut(event.messages, config.summarizeShare, resolveOptions(config).preserveRecentMessages, messageChars);
-          if (cut > 0 && config.summaryModel) {
-            const done = await summarizeOlder(cut, 'in the older part', planned);
-            if (done) return done;
-          }
-          throw new Error(config.apiKey ? 'Jev did not answer' : 'Jev is not available');
-        }
-        const { result, messages } = shortened;
-        // A small context keeps its shortened results: a summary there costs time and saves little.
+        // Nothing finished to fold: only old tool results are shortened.
+        const { result, messages } = await shorten();
+        // A small context keeps its shortened results: a fold there costs time and saves little.
         const small = result.stats.charsBefore <= config.smallContextChars && reductionRatio(result) > 0;
         if (!small && reductionRatio(result) < config.minReductionRatio) {
           const note = `below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`;
-          // No finished topic and little to shorten: the older part is summarized, the newest stays.
-          const cut = isPrecompute
-            ? 0
-            : olderPartCut(event.messages, config.summarizeShare, resolveOptions(config).preserveRecentMessages, messageChars);
-          if (cut > 0) {
-            const done = await summarizeOlder(cut, 'in the older part', planned);
+          // No finished topic and little to shorten: the older part is folded, the newest stays.
+          if (!isPrecompute && olderCut > 0) {
+            const done = await foldPart(olderCut, 'in the older part', planned);
             if (done) return done;
           }
           if (!isPrecompute) {
-            notify($, `built-in summary used: Jev would cut only ${percent(reductionRatio(result))} of the context`);
+            notify($, `built-in summary used: shortening would cut only ${percent(reductionRatio(result))} of the context`);
           }
           await record({ outcome: 'fallback', note }, result, undefined, planned);
           return next(event);
         }
+        const kept = await pointed(messages);
         if (isPrecompute) {
-          if (isMain) precomputed = { input: event.messages, output: messages };
-          await record({ outcome: 'precomputed', note: summarize(result) }, result, messages.length);
-          return { messages };
+          if (isMain) precomputed = { input: event.messages, output: kept };
+          await record({ outcome: 'precomputed', note: summarize(result) }, result, kept.length);
+          return { messages: kept };
         }
         notify($, headline(result));
-        await record({ outcome: 'applied', note: summarize(result) }, result, messages.length, planned);
-        return { messages };
+        await record({ outcome: 'applied', note: summarize(result) }, result, kept.length, planned);
+        return { messages: kept };
       } catch (error) {
         const note = error instanceof Error ? error.message : String(error);
         if (!isPrecompute) notify($, `built-in summary used: ${note}`);
@@ -666,6 +753,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (note) final = { ...outcome, messages: withNote(outcome.messages, note) };
     }
     if (followUp && final.messages) void $.prompt.submit({ text: followUp, asUser: true });
+    if (event.trigger !== 'precompute' && final.messages) cacheWatch = { after: event.trigger, ...(lastCache ? { before: lastCache } : {}) };
     return final;
   }).catch(($, event, next) => {
     // A hook that threw or overran its budget: the built-in summary takes over.
@@ -673,12 +761,44 @@ export const register: Register = (on: On, options: PluginOptions) => {
     return next(event);
   });
 
+  // The cache monitor: what each request of the main loop read from the prompt cache and wrote to it,
+  // logged for the first request after a compaction next to the last one before it.
+  if (configured.decisionLog) {
+    on('turn.step', async function* ($, event, next) {
+      const result = yield* next(event);
+      const usage = result?.usage;
+      if (event.agentId !== undefined || !usage) return result;
+      const cache: CacheTokens = { read: usage.cache_read_input_tokens, written: usage.cache_creation_input_tokens, input: usage.input_tokens };
+      const watch = cacheWatch;
+      cacheWatch = undefined;
+      lastCache = cache;
+      if (watch) await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'cache', ...watch, first: cache, model: usage.model });
+      return result;
+    });
+  }
+
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     // A subagent's turn or an interrupted one is no point to compact the main loop at.
+    if (compacting || event.agentId !== undefined || event.isAborted) return next(event);
+    if (configured.foldTurns) {
+      try {
+        // Asked only for a turn worth folding: a compaction that changes nothing still shows in the transcript.
+        const steps = closedTurnSteps((await $.session.messages()) as unknown as readonly Message[]);
+        if (steps && steps.chars >= configured.foldTurnMinChars) {
+          compacting = true;
+          foldingTurn = true;
+          await $.session.compact();
+        }
+      } catch {
+        // The turn stays as it is.
+      } finally {
+        compacting = false;
+        foldingTurn = false;
+      }
+    }
     // 0 leaves compaction to the engine's own threshold (`autoCompactWindow`),
     // which compacts mid-turn and goes on without a prompt.
     if (configured.compactAtPercent <= 0) return next(event);
-    if (compacting || event.agentId !== undefined || event.isAborted) return next(event);
     try {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
