@@ -161,7 +161,7 @@ describe('dropTurns', () => {
 
   it('merges an earlier placeholder into the new one instead of nesting it', () => {
     const earlier =
-      '[fast-jev-compaction removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"]';
+      '[context-fold removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"]';
     const history = [
       message('user', 'req A'),
       message('assistant', 'a1'),
@@ -180,7 +180,7 @@ describe('dropTurns', () => {
     expect(out.map((m) => m.text)).toEqual([
       'req A',
       'a1',
-      '[fast-jev-compaction removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"; "req B"]',
+      '[context-fold removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"; "req B"]',
       'req C',
     ]);
   });
@@ -196,11 +196,11 @@ describe('dropTurns', () => {
 
   it('keeps an old placeholder when the turn it sits in is removed', () => {
     const earlier =
-      '[fast-jev-compaction removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"]';
+      '[context-fold removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "req 0"]';
     const history = [message('user', 'req A'), message('user', earlier), message('user', 'req B')];
     const out = dropTurns(history, [decision('T01', 0, 2, true, 'req A'), decision('T02', 2, 3, false, 'req B')]);
     expect(out.map((m) => m.text)).toEqual([
-      '[fast-jev-compaction removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req A"; "req 0"]',
+      '[context-fold removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req A"; "req 0"]',
       'req B',
     ]);
   });
@@ -215,7 +215,7 @@ describe('dropTurns', () => {
     expect(out).toHaveLength(5);
     expect(out[0]).toEqual({
       role: 'user',
-      text: '[fast-jev-compaction removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req A"; "req B"]',
+      text: '[context-fold removed 2 earlier turn(s) whose topic the current work no longer needs. Their requests: "req A"; "req B"]',
       toolUses: [],
     });
     expect(out[1]).toBe(messages[4]);

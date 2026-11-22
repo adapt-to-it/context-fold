@@ -1,15 +1,15 @@
 {
-  "name": "fast-jev-compaction",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "context-fold",
+  "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
   "owner": {
     "name": "adapt-to-it",
     "url": "https://github.com/adapt-to-it"
   },
   "plugins": [
     {
-      "name": "fast-jev-compaction",
+      "name": "context-fold",
       "source": "./",
-      "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+      "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
       "version": "0.10.3",
       "license": "MIT"
     }

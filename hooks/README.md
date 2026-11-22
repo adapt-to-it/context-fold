@@ -1,6 +1,6 @@
 # hooks
 
-`fast-jev.ts` is the plugin's function-hook module: it handles
+`context-fold.ts` is the plugin's function-hook module: it handles
 `session.compact` and `turn.complete`, reads the plugin options and the
 TypeSafe key, and runs the steps described in the repository
 [README](../README.md). `log.ts` writes the decision log.

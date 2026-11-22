@@ -6,3 +6,8 @@ export * from './compact.js';
 export * from './messages.js';
 export * from './turns.js';
 export * from './rules.js';
+export * from './render.js';
+export * from './fold-spec.js';
+export * from './fold.js';
+export * from './unfold.js';
+export * from './turn-fold.js';

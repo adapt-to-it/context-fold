@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "context-fold",
   "version": "0.10.3",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
   "author": {
     "name": "adapt-to-it",
     "url": "https://github.com/adapt-to-it"
@@ -11,13 +11,31 @@
     "apiKey": {
       "type": "string",
       "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "description": "TypeSafe API key, read only when Use Jev is on. Leave unset to use TYPESAFE_API_KEY.",
       "sensitive": true
+    },
+    "useJev": {
+      "type": "boolean",
+      "title": "Use Jev",
+      "description": "Off by default, even with a key set: the summary model finds the finished topics and every old tool result is shortened. On: Jev finds the topics, picks the tool results to shorten and the project rules to re-add.",
+      "default": false
+    },
+    "foldTurns": {
+      "type": "boolean",
+      "title": "Fold turns as they close",
+      "description": "Off by default. On: when a turn ends, its tool calls and results are stored as a fold and one short note takes their place; the request and the final answer stay. The messages before the turn are untouched, so their prompt cache is reused. Each fold shows as a compaction in the transcript.",
+      "default": false
+    },
+    "foldTurnMinChars": {
+      "type": "number",
+      "title": "Fold turns from (characters)",
+      "description": "With Fold turns on: a turn is folded when its tool calls and results hold at least this many characters.",
+      "default": 20000
     },
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "With Use Jev on: minimum Jev probability that a tool result is still needed; below it the result is shortened.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -47,13 +65,13 @@
     "summaryModel": {
       "type": "string",
       "title": "Summary model",
-      "description": "Model that writes the summaries: haiku, sonnet or a full id. Empty: the built-in compact with the session model.",
+      "description": "Model that folds the old messages (a short state and one line per part) and, without Jev, finds the finished topics: haiku, sonnet or a full id. Empty: the built-in compact writes the state.",
       "default": "haiku"
     },
     "summarizeShare": {
       "type": "number",
       "title": "Summarized share",
-      "description": "Share of the text the built-in summarizer gets when no topic is finished; the newest part stays as it is.",
+      "description": "Share of the text that counts as the older part: its tool results are shortened without Jev, and it is folded when no topic is finished. The newest part stays as it is.",
       "default": 0.75
     },
     "maxStateTokens": {
@@ -71,13 +89,13 @@
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "description": "Characters of a shortened tool result kept in the context; 0 keeps only the note. The full text stays readable through the unfold tool.",
       "default": 300
     },
     "pruneTopics": {
       "type": "boolean",
-      "title": "Remove finished topics",
-      "description": "Asks Jev which old turns belong to a topic the current work no longer needs, and removes them.",
+      "title": "Fold finished topics",
+      "description": "Asks the summary model (or Jev, with Use Jev on) which old turns belong to a finished topic, and folds them.",
       "default": true
     },
     "topicThreshold": {
@@ -107,19 +125,19 @@
     "rulesFiles": {
       "type": "string",
       "title": "Rule files",
-      "description": "Comma-separated files the project rules live in, relative to the project root (CLAUDE.md, docs/decisions/*.md). After a summary the plugin adds an index of their sections and, in full, the introductions and the 1-2 sections Jev picks for the work in progress. Empty: off.",
+      "description": "Comma-separated files the project rules live in, relative to the project root (CLAUDE.md, docs/decisions/*.md). After a summary the plugin adds an index of their sections and, in full, the introductions and, with Use Jev on, the 1-2 sections Jev picks for the work in progress. Empty: off.",
       "default": ""
     },
     "decisionLog": {
       "type": "boolean",
       "title": "Decision log",
-      "description": "Off by default. On: write one JSON record per compaction (trigger, outcome, Jev's scores, summary model and time) under the log directory. The records hold request texts and tool inputs from your sessions.",
+      "description": "Off by default. On: write one JSON record per compaction (trigger, outcome, scores, summary model, time, fold ids) and one per unfold call (id or query, hits), one per turn fold, and after each compaction the prompt-cache tokens of the next request, under the log directory. The records hold request texts and tool inputs from your sessions.",
       "default": false
     },
     "logDir": {
       "type": "string",
       "title": "Decision log directory",
-      "description": "Where the decision log is written. Leave unset for ~/.claude/fast-jev-compaction/logs.",
+      "description": "Where the decision log is written. Leave unset for ~/.claude/context-fold/logs.",
       "default": ""
     }
   }

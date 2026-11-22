@@ -28,7 +28,7 @@ export const RULES_QUESTION = 'rules';
 export const RULES_PICK_INSTRUCTIONS =
   'Which unit of the project instructions is about the work in progress right now (the latest user request and what the assistant is doing in the last turns)?';
 /** Start of the note this module writes. */
-export const RULES_NOTE_HEAD = '[fast-jev-compaction] Project rules';
+export const RULES_NOTE_HEAD = '[context-fold] Project rules';
 
 /** Pieces shorter than this are dropped. */
 const MIN_UNIT_CHARS = 80;

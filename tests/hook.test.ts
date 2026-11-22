@@ -12,7 +12,7 @@ import {
   summarize,
   toSessionMessages,
   renderTranscript,
-} from '../hooks/fast-jev.ts';
+} from '../hooks/context-fold.ts';
 import { applyDecisions, collectToolCalls, decideCall, recentRequests, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
@@ -66,6 +66,9 @@ describe('hook config', () => {
       summarizeShare: 0.75,
       summaryModel: 'haiku',
       model: 'jev-1.13.0',
+      useJev: false,
+      foldTurns: false,
+      foldTurnMinChars: 20000,
       resumeAfterCompact: true,
       decisionLog: false,
       rulesFiles: [],
@@ -77,6 +80,9 @@ describe('hook config', () => {
       keepThreshold: 0.3,
       maxStateTokens: 1000,
       model: 'jev-x',
+      useJev: false,
+      foldTurns: false,
+      foldTurnMinChars: 20000,
       goal: 'g',
       compactAtPercent: 0,
       minReductionRatio: 0.25,
@@ -106,11 +112,11 @@ describe('session message mapping', () => {
     expect(out[0]).toBe(messages[0]);
     expect(out[1]?.handle).toBeUndefined();
     expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[context-fold truncated 1700 chars`),
     );
     expect(out[2]?.handle).toBeUndefined();
     expect(out[2]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[context-fold truncated 1700 chars`),
     );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
     expect(out[3]).toBe(messages[3]);
@@ -215,7 +221,7 @@ describe('latest request', () => {
     expect(latestRequest([message('user', '<command-name>/x</command-name>')])).toBe('');
     expect(latestRequest([message('user', 'now add docs'), message('user', 'Tool loaded.')])).toBe('now add docs');
     for (const note of [
-      '[fast-jev-compaction] Files used in the summarized part of the conversation (re-read any you need):\na.ts a.ts "write"',
+      '[context-fold] Files used in the summarized part of the conversation (re-read any you need):\na.ts a.ts "write"',
       'Stop hook feedback: docs/STATO.md is not up to date.',
       'Base directory for this skill: /Users/x/.claude/skills/review\n\n# Review',
       'Another Claude session sent a message:\n<agent-message from="a1">done</agent-message>',
@@ -228,7 +234,7 @@ describe('latest request', () => {
     expect(
       latestRequest([
         message('user', 'now add docs'),
-        message('user', '[fast-jev-compaction removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "x"]'),
+        message('user', '[context-fold removed 1 earlier turn(s) whose topic the current work no longer needs. Their requests: "x"]'),
       ]),
     ).toBe('now add docs');
   });
@@ -279,7 +285,7 @@ describe('jevAsker', () => {
 describe('filesNote', () => {
   it('lists every file with its name and action, one per line', () => {
     expect(filesNote({ written: ['/r/src/a.ts'], read: ['/r/b.md'], mentioned: [] })).toBe(
-      '[fast-jev-compaction] Files used in the summarized part of the conversation (re-read any you need):\n' +
+      '[context-fold] Files used in the summarized part of the conversation (re-read any you need):\n' +
         '/r/src/a.ts a.ts "write"\n/r/b.md b.md "read"',
     );
     expect(filesNote({ written: [], read: [], mentioned: [] })).toBe('');
