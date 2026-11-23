@@ -11,7 +11,7 @@ import type {
 
 import { compact, messageChars, reductionRatio, resolveOptions, shortenResults } from '../src/compact.js';
 import { foldDir, foldOlder, nextFoldNumbers, pointResults, writeFolds } from '../src/fold.js';
-import { TURN_FOLD_MIN_CHARS, UNFOLD_TOOL, UNFOLD_TOOL_NAME, type FoldStore } from '../src/fold-spec.js';
+import { TURN_FOLD_MIN_CHARS, TURN_NOTE_HEAD, UNFOLD_TOOL, UNFOLD_TOOL_NAME, type FoldStore } from '../src/fold-spec.js';
 import { closedTurnSteps, foldTurn } from '../src/turn-fold.js';
 import { unfold } from '../src/unfold.js';
 import { modelTopicAsker, olderPartCut, planTopics, summaryInstructions, touchedFiles, type TouchedFiles } from '../src/plan.js';
@@ -403,6 +403,9 @@ async function ensureUnfold($: { tool: { register: (tool: ToolSpec) => Promise<u
   return unfoldReady;
 }
 
+/** How long a turn fold asked through the `/compact` command waits for the compaction to start. */
+const TURN_FOLD_WAIT_MS = 10_000;
+
 /** What one request read from the prompt cache, wrote to it and sent uncached, in tokens. */
 type CacheTokens = { read: number; written: number; input: number };
 type LogHost = HomeHost & { fs: { write: (path: string, text: string) => Promise<unknown> } };
@@ -442,8 +445,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let compacting = false;
   /** The main conversation's last precomputed compaction: its input and its output. */
   let precomputed: Precomputed | undefined;
-  /** True while `turn.complete` asks for the fold of the turn that just closed. */
-  let foldingTurn = false;
+  /** The turn fold `turn.complete` asked for: how, and until when the request stands. */
+  let turnFold: { until: number; via: 'engine' | 'command' } | undefined;
+  /**
+   * True once the engine refused `$.session.compact()`: a headless (SDK) session, the desktop app's
+   * included, compacts only through the `/compact` command, which the plugin then runs itself.
+   */
+  let viaCommand = false;
   /** The cache tokens of the main loop's last request. */
   let lastCache: CacheTokens | undefined;
   /** Set by a compaction: the next request's cache tokens are logged against it. */
@@ -473,9 +481,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (event.agentId !== undefined) return next(event);
     // The steps of the turn that just closed, folded in place: every message before them is handed back
     // as the engine has it, so the prompt cache of that prefix stands and only the tail is written again.
-    if (foldingTurn && event.trigger === 'plugin') {
+    // The command reaches this hook as a manual compaction: it is the plugin's own when it carries no
+    // instructions and comes within the wait. It folds the turn or is skipped, and never goes on to a
+    // full compaction: one at every turn end would cost the whole conversation.
+    const asked = turnFold;
+    if (asked && (event.trigger === 'plugin' || event.trigger === 'manual') && !event.instructions?.trim() && Date.now() <= asked.until) {
+      turnFold = undefined;
+      const at = new Date().toISOString();
       try {
-        const at = new Date().toISOString();
         const folded = (await ensureUnfold($))
           ? await foldTurn({ messages: event.messages as readonly SessionMessage[], store: foldStore($), dir: await sessionFolds($), at, minChars: configured.foldTurnMinChars, result: resultsMessage })
           : undefined;
@@ -483,11 +496,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
         cacheWatch = { after: 'turn-fold', ...(lastCache ? { before: lastCache } : {}) };
         if (configured.decisionLog) {
           const { id, start, end, chars, calls } = folded;
-          await logEntry($, configured, { at, sessionId: await $.session.id(), trigger: 'turn-fold', id, start, end, chars, calls, messagesBefore: event.messages.length, messagesAfter: folded.messages.length });
+          await logEntry($, configured, { at, sessionId: await $.session.id(), trigger: 'turn-fold', via: asked.via, id, start, end, chars, calls, messagesBefore: event.messages.length, messagesAfter: folded.messages.length });
         }
         return { messages: folded.messages };
       } catch (error) {
-        return { skip: `turn fold not written (${error instanceof Error ? error.message : String(error)})` };
+        const reason = error instanceof Error ? error.message : String(error);
+        if (configured.decisionLog) await logEntry($, configured, { at, sessionId: await $.session.id(), trigger: 'turn-fold-error', via: asked.via, error: reason });
+        return { skip: `turn fold not written (${reason})` };
       }
     }
     // The text after `/compact` is the next prompt: it runs once the compaction stands.
@@ -783,17 +798,40 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (configured.foldTurns) {
       try {
         // Asked only for a turn worth folding: a compaction that changes nothing still shows in the transcript.
-        const steps = closedTurnSteps((await $.session.messages()) as unknown as readonly Message[]);
-        if (steps && steps.chars >= configured.foldTurnMinChars) {
-          compacting = true;
-          foldingTurn = true;
-          await $.session.compact();
+        // The whole history, the messages a compaction replaced included: only its end is the turn that closed.
+        const messages = (await $.session.messages()) as unknown as readonly Message[];
+        const steps = closedTurnSteps(messages);
+        // A folded turn keeps its first call: one with a large input would be folded again at every turn end.
+        const folded =
+          steps !== undefined &&
+          messages.slice(steps.start, steps.end).some((message) => (message.toolResults ?? []).some((result) => result.text.startsWith(TURN_NOTE_HEAD)));
+        if (steps && !folded && steps.chars >= configured.foldTurnMinChars) {
+          const until = Date.now() + TURN_FOLD_WAIT_MS;
+          if (!viaCommand) {
+            turnFold = { until, via: 'engine' };
+            compacting = true;
+            try {
+              await $.session.compact();
+            } catch (error) {
+              if (!/headless/u.test(error instanceof Error ? error.message : String(error))) throw error;
+              viaCommand = true;
+            } finally {
+              compacting = false;
+            }
+          }
+          if (viaCommand) {
+            turnFold = { until, via: 'command' };
+            await $.command.run({ command: 'compact' });
+          } else {
+            turnFold = undefined;
+          }
         }
-      } catch {
-        // The turn stays as it is.
-      } finally {
-        compacting = false;
-        foldingTurn = false;
+      } catch (error) {
+        // The turn stays as it is; the log says why.
+        turnFold = undefined;
+        if (configured.decisionLog) {
+          await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'turn-fold-error', error: error instanceof Error ? error.message : String(error) });
+        }
       }
     }
     // 0 leaves compaction to the engine's own threshold (`autoCompactWindow`),
