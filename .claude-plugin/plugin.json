@@ -1,6 +1,6 @@
 {
   "name": "context-fold",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
   "author": {
     "name": "adapt-to-it",

@@ -144,25 +144,40 @@ the shape come from measurements:
   added right after the request changes how the request is sent, and the
   cache then stops before it.
 
-Measured on a real interactive session (Claude Code 2.1.312, Haiku, five
-turns that read 24,000-token files, cache tokens taken from each response):
+Measured on real sessions with Haiku, six turns, four of them reading
+24,000-token files, cache tokens taken from each response:
 
-| | Context at the end | Read from cache after a fold | Written after a fold |
-| --- | --- | --- | --- |
-| `foldTurns` off | 109,299 tokens | n/a | n/a |
-| `foldTurns` on | 38,679 tokens | 37,543 to 38,386 | 228 to 472 |
+| Session | `foldTurns` | Context at the end | Read from cache after a fold | Written after a fold |
+| --- | --- | --- | --- | --- |
+| Desktop app's engine (2.1.330, SDK mode) | off | 158,698 tokens | n/a | n/a |
+| Desktop app's engine (2.1.330, SDK mode) | on | 41,098 tokens | 39,518 to 40,661 | 345 to 706 |
+| Terminal (2.1.312, five turns) | off | 109,299 tokens | n/a | n/a |
+| Terminal (2.1.312, five turns) | on | 38,679 tokens | 37,543 to 38,386 | 228 to 472 |
+
+How the fold starts depends on the session:
+
+- In the terminal the plugin asks the engine for a compaction
+  (`$.session.compact()`).
+- In the desktop app and other SDK sessions the engine refuses that call,
+  so the plugin runs the `/compact` command itself. The transcript then
+  shows `/compact` and `Compacted` after each folded turn, and the session
+  reports one more, empty, result.
+
+A compaction the plugin asked for folds the turn or is skipped. It never
+goes on to a full compaction.
 
 What it costs:
 
-- A folded result is no longer in the context. In the same test the fourth
-  turn asked for two files read earlier: with `foldTurns` on the model read
-  them again (47,784 tokens written), with it off it answered from the
-  context.
+- A folded result is no longer in the context. In the terminal test the
+  fourth turn asked for two files read earlier: with `foldTurns` on the
+  model read them again (47,784 tokens written), with it off it answered
+  from the context.
 - Each fold shows as a compaction in the transcript.
 - A turn is folded only when it ends. A long autonomous turn is not folded
   halfway.
 
-Not measured yet: long sessions, the desktop app, models other than Haiku.
+Not measured yet: long sessions, models other than Haiku, and how the
+desktop app's window shows the extra `/compact` lines.
 
 ## Jev
 
@@ -300,7 +315,8 @@ With `decisionLog` on, the plugin writes JSON records to
 | File | Written | Holds |
 | --- | --- | --- |
 | `<time>-<trigger>.json` | at every compaction | the trigger, the outcome (`applied`, `summarized`, `fallback`, `error`), the cut point, the score of each turn, the files of the folded part, the summary model with its time (`summaryMs`), characters read (`summarizedChars`) and output tokens (`summaryOutputTokens`), and the fold ids (`folds`) |
-| `<time>-turn-fold.json` | at every turn fold | the fold id, the messages it covered, their characters and the number of calls |
+| `<time>-turn-fold.json` | at every turn fold | the fold id, the messages it covered, their characters, the number of calls and how it started (`via`: `engine` or `command`) |
+| `<time>-turn-fold-error.json` | when a turn fold fails | the error; the turn stays as it was |
 | `<time>-unfold.json` | at every `unfold` call | the id or the query and the number of hits; a search with no hit shows where the index lines were not enough |
 | `<time>-cache.json` | at the first request after a compaction or a turn fold | the tokens that request read from the prompt cache, wrote to it and sent uncached (`first`), next to those of the last request before it (`before`) |
 
