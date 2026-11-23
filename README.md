@@ -31,19 +31,24 @@ steps in order and stops at the first one that applies:
    requests. When the turns before that point hold at least
    `minReductionRatio` of the text, the plugin folds them and keeps the
    later turns verbatim.
-2. **Shortened tool results.** With no finished topic, the plugin shortens
-   the tool results in the oldest `summarizeShare` of the text and keeps
-   every call and every text. When that share ends among the newest
-   `preserveRecentMessages` messages, it shortens every result before them.
-   When this cuts at least `minReductionRatio` of the text, the result
-   stands. Up to `smallContextChars` characters it stands however little it
-   cuts, because a fold of a small context costs more time than it saves.
-3. **Older part.** When shortening cuts too little, the plugin folds the
-   oldest `summarizeShare` of the text. The cut falls before an assistant
-   message, so no tool call is split from its result, and never inside the
-   newest `preserveRecentMessages` messages.
+2. **Older part.** With no finished topic, the plugin folds the oldest
+   `summarizeShare` of the text and keeps the rest verbatim. The cut falls
+   before an assistant message, so no tool call is split from its result,
+   and never inside the newest `preserveRecentMessages` messages.
+3. **Shortened tool results.** Up to `smallContextChars` characters there is
+   no fold, because a fold of a small context costs more time than it
+   saves: the plugin shortens the tool results in the older part and keeps
+   every call and every text. The same happens on a larger context when the
+   fold cannot be written, if shortening cuts at least `minReductionRatio`
+   of the text.
 4. **Built-in compact.** When none of the steps above applies, or a step
    fails, Claude Code's own compact summarizes the whole session.
+
+Claude Code also asks for a compaction ahead of time, in the background.
+The plugin answers it with the same steps, so the fold is ready when the
+compaction runs and nobody waits for the summary model. Until then the
+fold files are not written and the `unfold` tool is not added: a
+compaction prepared ahead may never run.
 
 ### Folds
 
@@ -118,6 +123,29 @@ hold the text of your sessions, as the transcripts under
   sections. On 86 labelled compactions of three projects, Jev's first pick
   was a section the following work needed in 84% of the cases. The
   benchmark is in `examples/rules/`.
+
+## Folding as the session goes
+
+On by default. Claude Code compacts when the context reaches its own
+threshold, often in the middle of a turn, and by then every request has
+read a large context. The plugin does not wait for that: when a turn ends
+and the context is past `foldAtTokens` tokens (150,000 by default), it
+compacts there, with the steps above. The older part goes into folds and
+the newest messages stay as they are.
+
+- It folds again only after the context has gained 30,000 tokens since the
+  last compaction, so a context that a fold cannot bring under the
+  threshold is not folded at every turn.
+- Claude Code's own threshold stays as it is and still applies inside a
+  long turn: a plugin cannot compact while a turn runs.
+- In the desktop app and in other SDK sessions the plugin runs the
+  `/compact` command, so the transcript shows it.
+- `foldAtTokens` set to 0 turns it off.
+
+Replayed on a week of real sessions (101 sessions, 24,000 requests), a
+threshold of 150,000 tokens cut the tokens read from the prompt cache by
+37% and the tokens written by 20%, and Claude Code's own threshold was
+reached 15 times instead of 156.
 
 ## Folding turns as they close
 
@@ -275,6 +303,7 @@ Compaction:
 | `summarizeShare` | `0.75` | Share of the text that counts as the older part (steps 2 and 3) |
 | `preserveRecentMessages` | `6` | Newest messages never folded or shortened |
 | `truncateHeadChars` | `300` | Characters kept from a shortened tool result |
+| `foldAtTokens` | `150000` | Context tokens past which the plugin folds at the end of a turn; 0 turns it off |
 | `compactAtPercent` | `0` | Context percentage at which the plugin compacts at the end of a turn; 0 leaves the timing to Claude Code |
 | `resumeAfterCompact` | `true` | Submits a resume prompt after a compaction started by `compactAtPercent` |
 | `rulesFiles` | empty | Rule files re-added after a summary, comma-separated; `dir/*.md` takes a folder |
