@@ -38,6 +38,7 @@ const HOOK_DEFAULTS = {
   useJev: false,
   foldTurns: false,
   foldTurnMinChars: TURN_FOLD_MIN_CHARS,
+  foldAtTokens: 150_000,
   resumeAfterCompact: true,
   decisionLog: false,
 };
@@ -94,6 +95,8 @@ export type HookConfig = CompactOptions & {
   foldTurns: boolean;
   /** A closed turn is folded when its steps hold at least these characters. */
   foldTurnMinChars: number;
+  /** Past these context tokens the plugin folds at the end of a turn; 0 leaves the timing to the engine. */
+  foldAtTokens: number;
   resumeAfterCompact: boolean;
   /** Writes one JSON record per compaction under `logDir`. */
   decisionLog: boolean;
@@ -144,6 +147,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     useJev: typeof options['useJev'] === 'boolean' ? options['useJev'] : HOOK_DEFAULTS.useJev,
     foldTurns: typeof options['foldTurns'] === 'boolean' ? options['foldTurns'] : HOOK_DEFAULTS.foldTurns,
     foldTurnMinChars: optionNumber(options, 'foldTurnMinChars', HOOK_DEFAULTS.foldTurnMinChars),
+    foldAtTokens: optionNumber(options, 'foldAtTokens', HOOK_DEFAULTS.foldAtTokens),
     resumeAfterCompact:
       typeof options['resumeAfterCompact'] === 'boolean'
         ? options['resumeAfterCompact']
@@ -406,6 +410,18 @@ async function ensureUnfold($: { tool: { register: (tool: ToolSpec) => Promise<u
 /** How long a turn fold asked through the `/compact` command waits for the compaction to start. */
 const TURN_FOLD_WAIT_MS = 10_000;
 
+/** How many tokens the context must have gained since the last compaction before the flow folds again. */
+export const FLOW_MIN_GROWTH_TOKENS = 30_000;
+
+/**
+ * True when the flow folds at this turn's end: the context is past `at` tokens and has gained
+ * enough since `floor`, its size after the last compaction. A context that a fold cannot
+ * bring under `at` (a large system prompt, many tools) is not folded again at every turn.
+ */
+export function flowDue(tokens: number, at: number, floor: number | undefined): boolean {
+  return at > 0 && tokens >= at && (floor === undefined || tokens - floor >= FLOW_MIN_GROWTH_TOKENS);
+}
+
 /** What one request read from the prompt cache, wrote to it and sent uncached, in tokens. */
 type CacheTokens = { read: number; written: number; input: number };
 type LogHost = HomeHost & { fs: { write: (path: string, text: string) => Promise<unknown> } };
@@ -420,7 +436,73 @@ async function logEntry($: LogHost, config: HookConfig, entry: { at: string; ses
   await $.fs.write(logPath(await logDirOf($, config), entry), `${JSON.stringify(entry, null, 2)}\n`).catch(() => undefined);
 }
 
-export type Precomputed = { input: readonly SessionMessage[]; output: SessionMessage[] };
+/** What is known about compacting between turns in this session. */
+type BetweenTurns = {
+  /** True while the plugin's own compaction runs: `turn.complete` does not ask for another. */
+  compacting: boolean;
+  /**
+   * True once the engine refused `$.session.compact()`: a headless (SDK) session, the desktop app's
+   * included, compacts only through the `/compact` command, which the plugin then runs itself.
+   */
+  viaCommand: boolean;
+};
+
+/**
+ * Compacts between turns: through the engine, or through the `/compact` command where the engine
+ * refuses a plugin's call. `mark` is told which, right before each attempt.
+ */
+async function compactBetweenTurns(
+  $: { session: { compact: () => Promise<unknown> }; command: { run: (args: { command: string }) => Promise<unknown> } },
+  state: BetweenTurns,
+  mark: (via: 'engine' | 'command') => void = () => undefined,
+): Promise<void> {
+  if (!state.viaCommand) {
+    mark('engine');
+    state.compacting = true;
+    try {
+      await $.session.compact();
+      return;
+    } catch (error) {
+      if (!/headless/u.test(error instanceof Error ? error.message : String(error))) throw error;
+      state.viaCommand = true;
+    } finally {
+      state.compacting = false;
+    }
+  }
+  mark('command');
+  await $.command.run({ command: 'compact' });
+}
+
+export type Precomputed = {
+  input: readonly SessionMessage[];
+  output: SessionMessage[];
+  /** Writes the folds the output points to; they are held back until the compaction is applied. */
+  flush?: () => Promise<void>;
+};
+
+/**
+ * A fold store that holds its writes back: a precomputed compaction may never be applied,
+ * and a fold nobody points to would only add false hits to a search.
+ */
+export function heldStore(store: FoldStore): { store: FoldStore; flush: () => Promise<void> } {
+  const held = new Map<string, string>();
+  return {
+    store: {
+      read: async (path) => held.get(path) ?? (await store.read(path)),
+      write: async (path, text) => {
+        held.set(path, text);
+      },
+      list: async (dir) => {
+        const names = [...held.keys()].filter((path) => path.startsWith(`${dir}/`)).map((path) => path.slice(dir.length + 1));
+        return [...new Set([...(await store.list(dir)), ...names])];
+      },
+    },
+    flush: async () => {
+      for (const [path, text] of held) await store.write(path, text);
+      held.clear();
+    },
+  };
+}
 
 /**
  * The precomputed compaction applied to `messages`: its output plus every
@@ -442,18 +524,17 @@ export function reusePrecomputed(
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
-  let compacting = false;
+  const between: BetweenTurns = { compacting: false, viaCommand: false };
   /** The main conversation's last precomputed compaction: its input and its output. */
   let precomputed: Precomputed | undefined;
   /** The turn fold `turn.complete` asked for: how, and until when the request stands. */
   let turnFold: { until: number; via: 'engine' | 'command' } | undefined;
-  /**
-   * True once the engine refused `$.session.compact()`: a headless (SDK) session, the desktop app's
-   * included, compacts only through the `/compact` command, which the plugin then runs itself.
-   */
-  let viaCommand = false;
   /** The cache tokens of the main loop's last request. */
   let lastCache: CacheTokens | undefined;
+  /** The context's tokens at the first turn end after the last compaction: the flow counts growth from here. */
+  let flowFloor: number | undefined;
+  /** Set by a compaction of the main conversation, until the next turn end has measured the context. */
+  let compactedSince = false;
   /** Set by a compaction: the next request's cache tokens are logged against it. */
   let cacheWatch: { after: string; before?: CacheTokens } | undefined;
   on('session.start', async ($, event, next) => {
@@ -540,19 +621,42 @@ export const register: Register = (on: On, options: PluginOptions) => {
       // The engine compacts what was precomputed, plus what came after: answer at once.
       const reused = isMain && !isPrecompute ? reusePrecomputed(precomputed, event.messages) : undefined;
       if (reused) {
-        precomputed = undefined;
-        notify($, `${event.messages.length} → ${reused.length} messages, from the precomputed compaction`);
-        await record({ outcome: 'reused' }, undefined, reused.length);
-        return { messages: reused };
+        const flush = precomputed?.flush;
+        // The folds it points to are written now; when they cannot be, the compaction is worked out again.
+        const readable = !flush || (await ensureUnfold($).then((ok) => (ok ? flush().then(() => true) : false)).catch(() => false));
+        if (readable) {
+          precomputed = undefined;
+          notify($, `${event.messages.length} → ${reused.length} messages, from the precomputed compaction`);
+          await record({ outcome: 'reused' }, undefined, reused.length);
+          return { messages: reused };
+        }
       }
-      // A new precompute replaces the last one, whatever it comes to.
-      if (isMain && isPrecompute) precomputed = undefined;
+      // A precompute that could not be reused is paid twice: the log says why it was lost.
+      if (isMain && !isPrecompute && precomputed && configured.decisionLog) {
+        const { input } = precomputed;
+        const at = input.findIndex((m, i) => m.handle === undefined || m.handle !== event.messages[i]?.handle);
+        const why =
+          input.length > event.messages.length
+            ? `the conversation has ${event.messages.length} messages, the precompute read ${input.length}`
+            : at < 0
+              ? 'its folds could not be written'
+              : input[at]!.handle === undefined
+                ? `message ${at} of ${input.length} has no handle`
+                : `message ${at} of ${input.length} changed`;
+        await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'precompute-miss', after: event.trigger, why });
+      }
+      // A new precompute replaces the last one, whatever it comes to; a compaction worked out anew leaves it stale.
+      if (isMain) precomputed = undefined;
       if (!isPrecompute) $.ui.status('Compacting the context…');
       try {
         // Jev is asked only when it is switched on, has a key and is not paused.
         const key = configured.useJev && Date.now() >= jevPausedUntil ? await getApiKey($, configured) : undefined;
         const config = { ...configured, apiKey: key };
-        const store = foldStore($);
+        // A precompute writes nothing and registers no tool: both wait for the compaction that applies it,
+        // which writes the whole context again anyway. A tool added earlier would cost the prompt cache once more.
+        const holding = isPrecompute ? heldStore(foldStore($)) : undefined;
+        const store = holding?.store ?? foldStore($);
+        const canUnfold = () => (isPrecompute ? Promise.resolve(true) : ensureUnfold($));
         const dir = await sessionFolds($);
         const at = new Date().toISOString();
         const fetchFn: HookFetch = async (url, init) => {
@@ -579,7 +683,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         /** The shortened results stored as folds, each note naming its id; as they are when that fails. */
         const pointed = async (messages: SessionMessage[]): Promise<SessionMessage[]> => {
           try {
-            if (!(await ensureUnfold($))) return messages;
+            if (!(await canUnfold())) return messages;
             const { r } = nextFoldNumbers(await store.list(dir));
             const out = pointResults(event.messages, messages, r, at);
             await writeFolds(store, dir, out.entries);
@@ -634,7 +738,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           let outputTokens: number | undefined;
           const complete = async (system: string, prompt: string): Promise<string | undefined> => {
             if (!config.summaryModel) return undefined;
-            $.ui.status(`${config.summaryModel} is folding the messages ${what}…`);
+            if (!isPrecompute) $.ui.status(`${config.summaryModel} is folding the messages ${what}…`);
             const reply = await $.model
               .complete({ model: config.summaryModel, system, prompt, maxTokens: SUMMARY_MAX_TOKENS, effort: 'low', timeoutMs: 120_000 })
               .catch(() => undefined);
@@ -642,7 +746,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
             return reply?.isAnswered && reply.text.trim() ? reply.text : undefined;
           };
           // Without the tool or the folder nothing could be read back: the built-in summary stands alone.
-          const fold = (await ensureUnfold($))
+          const fold = (await canUnfold())
             ? await foldOlder({ older, reading, store, dir, instructions, complete, at }).catch(() => undefined)
             : undefined;
           let summarized: { messages?: readonly SessionMessage[] } | undefined;
@@ -650,6 +754,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
           if (fold?.state) {
             model = config.summaryModel;
             summarized = { messages: [userMessage(FOLD_INTRO + fold.state)] };
+          } else if (isPrecompute) {
+            // No state from the summary model: the precompute keeps to the shortened results.
+            return undefined;
           } else {
             // The summary model wrote no state: the built-in summarizer writes it, the index lines stay.
             $.ui.status(`Claude is summarizing the messages ${what}…`);
@@ -663,9 +770,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
             ...event.messages.slice(cut),
           ];
           const parts = fold ? `folded into ${fold.ids.length} parts` : 'summarized';
-          notify($, `${older.length} messages ${what} ${parts} by ${model} in ${Math.round((Date.now() - started) / 1000)} s, ${event.messages.length - cut} kept as they are`);
+          if (isPrecompute) {
+            if (isMain) precomputed = { input: event.messages, output: messages as SessionMessage[], ...(holding ? { flush: holding.flush } : {}) };
+          } else {
+            notify($, `${older.length} messages ${what} ${parts} by ${model} in ${Math.round((Date.now() - started) / 1000)} s, ${event.messages.length - cut} kept as they are`);
+          }
           await record(
-            { outcome: 'summarized', note: `${what}: ${older.length} of ${event.messages.length} messages ${parts} (${percent(share)} of the text)` },
+            { outcome: isPrecompute ? 'precomputed' : 'summarized', note: `${what}: ${older.length} of ${event.messages.length} messages ${parts} (${percent(share)} of the text)` },
             undefined,
             messages.length,
             {
@@ -687,7 +798,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         // Finished topics are folded, alone; the rest stays as it is.
         // Without Jev (no key, no credit, no answer) the summary model picks the cut.
         const summaryModel = config.summaryModel;
-        if (!isPrecompute && config.pruneTopics !== false && (config.apiKey || summaryModel)) {
+        if (config.pruneTopics !== false && (config.apiKey || summaryModel)) {
           const reference = event.instructions?.trim() ?? '';
           const empty = { cut: 0, turns: [], stateTokens: 0, stateStage: '' };
           const viaModel = () =>
@@ -695,7 +806,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
               ? planTopics(
                   event.messages,
                   modelTopicAsker(async (prompt) => {
-                    $.ui.status(`${summaryModel} is looking for finished topics…`);
+                    if (!isPrecompute) $.ui.status(`${summaryModel} is looking for finished topics…`);
                     const reply = await $.model.complete({ model: summaryModel, prompt, maxTokens: 50, effort: 'low', timeoutMs: 30_000 });
                     if (!reply.isAnswered) throw new Error(reply.reason);
                     return reply.text;
@@ -725,17 +836,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
             if (done) return done;
           }
         }
-        // Nothing finished to fold: only old tool results are shortened.
+        // No finished topic: old tool results are shortened.
         const { result, messages } = await shorten();
         // A small context keeps its shortened results: a fold there costs time and saves little.
         const small = result.stats.charsBefore <= config.smallContextChars && reductionRatio(result) > 0;
+        // A larger one has its older part folded, the newest kept: shortening alone leaves about half
+        // of the context, all of it written to the cache again.
+        if (!small && olderCut > 0) {
+          const done = await foldPart(olderCut, 'in the older part', planned);
+          if (done) return done;
+        }
+        // The fold was not written: the shortened results stand when they cut enough.
         if (!small && reductionRatio(result) < config.minReductionRatio) {
           const note = `below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}`;
-          // No finished topic and little to shorten: the older part is folded, the newest stays.
-          if (!isPrecompute && olderCut > 0) {
-            const done = await foldPart(olderCut, 'in the older part', planned);
-            if (done) return done;
-          }
           if (!isPrecompute) {
             notify($, `built-in summary used: shortening would cut only ${percent(reductionRatio(result))} of the context`);
           }
@@ -744,7 +857,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         }
         const kept = await pointed(messages);
         if (isPrecompute) {
-          if (isMain) precomputed = { input: event.messages, output: kept };
+          if (isMain) precomputed = { input: event.messages, output: kept, ...(holding ? { flush: holding.flush } : {}) };
           await record({ outcome: 'precomputed', note: summarize(result) }, result, kept.length);
           return { messages: kept };
         }
@@ -769,6 +882,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
     if (followUp && final.messages) void $.prompt.submit({ text: followUp, asUser: true });
     if (event.trigger !== 'precompute' && final.messages) cacheWatch = { after: event.trigger, ...(lastCache ? { before: lastCache } : {}) };
+    if (event.trigger !== 'precompute' && event.agentId === undefined && final.messages) compactedSince = true;
     return final;
   }).catch(($, event, next) => {
     // A hook that threw or overran its budget: the built-in summary takes over.
@@ -794,7 +908,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     // A subagent's turn or an interrupted one is no point to compact the main loop at.
-    if (compacting || event.agentId !== undefined || event.isAborted) return next(event);
+    if (between.compacting || event.agentId !== undefined || event.isAborted) return next(event);
+    let turnFoldAsked = false;
     if (configured.foldTurns) {
       try {
         // Asked only for a turn worth folding: a compaction that changes nothing still shows in the transcript.
@@ -807,24 +922,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
           messages.slice(steps.start, steps.end).some((message) => (message.toolResults ?? []).some((result) => result.text.startsWith(TURN_NOTE_HEAD)));
         if (steps && !folded && steps.chars >= configured.foldTurnMinChars) {
           const until = Date.now() + TURN_FOLD_WAIT_MS;
-          if (!viaCommand) {
-            turnFold = { until, via: 'engine' };
-            compacting = true;
-            try {
-              await $.session.compact();
-            } catch (error) {
-              if (!/headless/u.test(error instanceof Error ? error.message : String(error))) throw error;
-              viaCommand = true;
-            } finally {
-              compacting = false;
-            }
-          }
-          if (viaCommand) {
-            turnFold = { until, via: 'command' };
-            await $.command.run({ command: 'compact' });
-          } else {
-            turnFold = undefined;
-          }
+          turnFoldAsked = true;
+          await compactBetweenTurns($, between, (via) => {
+            turnFold = { until, via };
+          });
+          // Through the command the compaction comes later: the request stands until it does.
+          if (!between.viaCommand) turnFold = undefined;
         }
       } catch (error) {
         // The turn stays as it is; the log says why.
@@ -834,13 +937,38 @@ export const register: Register = (on: On, options: PluginOptions) => {
         }
       }
     }
+    // The flow: past `foldAtTokens` the older part is folded here, at the turn's end, so the engine's
+    // own threshold, which compacts in the middle of a turn, is rarely reached.
+    if (configured.foldAtTokens > 0 && !turnFoldAsked) {
+      try {
+        const tokens = (await $.session.usage()).context.tokens ?? 0;
+        if (compactedSince) {
+          compactedSince = false;
+          flowFloor = tokens;
+        }
+        if (flowDue(tokens, configured.foldAtTokens, flowFloor)) {
+          // Counted from here even when the compaction changes nothing: no second try at the next turn.
+          const floor = flowFloor;
+          flowFloor = tokens;
+          if (configured.decisionLog) {
+            await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'flow', tokens, floor, foldAtTokens: configured.foldAtTokens });
+          }
+          await compactBetweenTurns($, between);
+          return next(event);
+        }
+      } catch (error) {
+        if (configured.decisionLog) {
+          await logEntry($, configured, { at: new Date().toISOString(), sessionId: await $.session.id(), trigger: 'flow-error', error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+    }
     // 0 leaves compaction to the engine's own threshold (`autoCompactWindow`),
     // which compacts mid-turn and goes on without a prompt.
     if (configured.compactAtPercent <= 0) return next(event);
     try {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      compacting = true;
+      between.compacting = true;
       const outcome = await $.session.compact();
       // A plugin's prompt runs once the session is idle, so it is not awaited here.
       if (configured.resumeAfterCompact && !('skip' in outcome && outcome.skip)) {
@@ -849,7 +977,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
     } catch (error) {
       notify($, `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
     } finally {
-      compacting = false;
+      between.compacting = false;
     }
     return next(event);
   });

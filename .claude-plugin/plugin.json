@@ -1,6 +1,6 @@
 {
   "name": "context-fold",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "description": "Folds finished work out of a Claude Code session: the messages go to files, a short state and one line per part stay, and Claude reads any part back.",
   "author": {
     "name": "adapt-to-it",
@@ -43,6 +43,12 @@
       "title": "Recent messages to preserve",
       "description": "Number of newest messages pinned from compaction.",
       "default": 6
+    },
+    "foldAtTokens": {
+      "type": "number",
+      "title": "Flow threshold (tokens)",
+      "description": "Context size, in tokens, past which the plugin folds the older part at the end of a turn, so Claude Code's own compaction, which runs in the middle of a turn, is rarely reached. It folds again only after the context has gained 30,000 tokens. 0 turns it off. Default 150000.",
+      "default": 150000
     },
     "compactAtPercent": {
       "type": "number",
